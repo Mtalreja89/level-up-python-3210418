@@ -1,0 +1,652 @@
+================================================================================
+ GL WORKFLOW PIPELINE ENGINE: COMPLETE TECHNICAL SPECIFICATION BLUEPRINT
+================================================================================
+ Scope: Oracle DB SQL DDL, Data Dictionary, Test Pipeline Seed Data, 
+        and Angular 18 Canvas Frontend Implementation.
+ Date: November 2026
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ SECTION 1: DATABASE ARCHITECTURE & TABLE DOCUMENTATION
+--------------------------------------------------------------------------------
+
+The database schema is organized into four distinct architectural layers:
+
+1. REFERENCE LAYER (Master Data)
+   - DATA_SOURCES: Master list of upstream/downstream financial systems (e.g., FXO, POWER, GECD).
+   - COMPONENT_TYPES: Master list of allowed workflow block types (data_transfer, exclusion_type, filter_type, control_type, pipeline, logical_component).
+   - DATA_SOURCE_COMPONENTS: Mapping between component types and data sources. NULL data_source_id represents a Global Logical Component.
+   - DATA_SOURCE_COMPONENT_TASKS: Reusable task function catalog (pre, main, post phases) available for components.
+
+2. PIPELINE MASTER & SCHEDULE LAYER
+   - PIPELINES: Top-level pipeline definitions tied to a specific data source, carrying business justification and top-level spec links.
+   - PIPELINE_SCHEDULES: Strict 1:1 relationship with pipelines storing cron expressions, execution intervals, and active schedule flags.
+
+3. RUNTIME PIPELINE INSTANCE & EDGE LAYER
+   - PIPELINE_COMPONENTS: Instances of components dragged onto the canvas for a specific pipeline, tracking sequence numbers and child/nested pipelines.
+   - PIPELINE_COMPONENT_EDGES: Inter-component conditional branching routes (success, failure, custom expression evaluation).
+   - COMPONENT_TASK_EDGES: Intra-component task-level failure recovery and branching routes.
+
+4. DATA TRANSFER & FIELD TRANSFORMATIONS LAYER
+   - TASK_TABLE_MAPPINGS: Direct source-to-destination table pairs anchored to the Main phase task of a data_transfer component.
+   - TASK_FIELD_TRANSFORM_MAPPINGS: Column-level mapping rules (Column A -> Column B) with transformation functions, parameters, and audit justifications.
+
+
+--------------------------------------------------------------------------------
+ SECTION 2: ORACLE SQL DDL SCHEMA (DROP & CREATE SCRIPTS)
+--------------------------------------------------------------------------------
+
+-- =====================================================================
+-- DROP EXISTING TABLES IN REVERSE DEPENDENCY ORDER
+-- =====================================================================
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE task_field_transform_mappings CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE task_table_mappings CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE component_task_edges CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE pipeline_component_edges CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE pipeline_components CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE pipeline_schedules CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE pipelines CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE data_source_component_tasks CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE data_source_components CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE component_types CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE data_sources CASCADE CONSTRAINTS';
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+
+-- =====================================================================
+-- CREATE TABLES
+-- =====================================================================
+
+-- 1. DATA_SOURCES
+CREATE TABLE data_sources (
+    data_source_id NUMBER(10) NOT NULL,
+    data_source_name VARCHAR2(50) NOT NULL,
+    description VARCHAR2(250),
+    is_active CHAR(1) DEFAULT 'Y' NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_data_sources PRIMARY KEY (data_source_id),
+    CONSTRAINT uk_data_source_name UNIQUE (data_source_name),
+    CONSTRAINT chk_ds_active CHECK (is_active IN ('Y', 'N'))
+);
+
+-- 2. COMPONENT_TYPES
+CREATE TABLE component_types (
+    component_type_id NUMBER(10) NOT NULL,
+    component_type_name VARCHAR2(50) NOT NULL,
+    description VARCHAR2(250),
+    is_active CHAR(1) DEFAULT 'Y' NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_component_types PRIMARY KEY (component_type_id),
+    CONSTRAINT uk_component_type_name UNIQUE (component_type_name),
+    CONSTRAINT chk_ct_active CHECK (is_active IN ('Y', 'N'))
+);
+
+-- 3. DATA_SOURCE_COMPONENTS
+CREATE TABLE data_source_components (
+    ds_component_id NUMBER(10) NOT NULL,
+    data_source_id NUMBER(10) NULL, -- NULL indicates global logical component
+    component_type_id NUMBER(10) NOT NULL,
+    is_active CHAR(1) DEFAULT 'Y' NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_data_source_components PRIMARY KEY (ds_component_id),
+    CONSTRAINT fk_dsc_datasource FOREIGN KEY (data_source_id) REFERENCES data_sources(data_source_id),
+    CONSTRAINT fk_dsc_componenttype FOREIGN KEY (component_type_id) REFERENCES component_types(component_type_id),
+    CONSTRAINT chk_dsc_active CHECK (is_active IN ('Y', 'N'))
+);
+
+-- 4. DATA_SOURCE_COMPONENT_TASKS
+CREATE TABLE data_source_component_tasks (
+    task_id NUMBER(10) NOT NULL,
+    ds_component_id NUMBER(10) NOT NULL,
+    phase VARCHAR2(20) NOT NULL,
+    task_name VARCHAR2(150) NOT NULL,
+    description VARCHAR2(250),
+    sequence_number NUMBER(10) NOT NULL,
+    priority NUMBER(10) DEFAULT 0 NOT NULL,
+    run_in_parallel CHAR(1) DEFAULT 'N' NOT NULL,
+    trigger_rule VARCHAR2(50) DEFAULT 'all_success' NOT NULL,
+    is_active CHAR(1) DEFAULT 'Y' NOT NULL,
+    functional_spec_url VARCHAR2(500),
+    technical_spec_url VARCHAR2(500),
+    task_docstring CLOB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_ds_component_tasks PRIMARY KEY (task_id),
+    CONSTRAINT fk_dsct_ds_component FOREIGN KEY (ds_component_id) REFERENCES data_source_components(ds_component_id),
+    CONSTRAINT chk_dsct_phase CHECK (phase IN ('pre', 'main', 'post')),
+    CONSTRAINT chk_dsct_parallel CHECK (run_in_parallel IN ('Y', 'N')),
+    CONSTRAINT chk_dsct_active CHECK (is_active IN ('Y', 'N'))
+);
+
+-- 5. PIPELINES
+CREATE TABLE pipelines (
+    pipeline_id NUMBER(10) NOT NULL,
+    pipeline_name VARCHAR2(150) NOT NULL,
+    data_source_id NUMBER(10) NOT NULL,
+    description VARCHAR2(500),
+    is_active CHAR(1) DEFAULT 'Y' NOT NULL,
+    functional_spec_url VARCHAR2(500),
+    technical_spec_url VARCHAR2(500),
+    business_justification CLOB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_pipelines PRIMARY KEY (pipeline_id),
+    CONSTRAINT fk_pipeline_datasource FOREIGN KEY (data_source_id) REFERENCES data_sources(data_source_id),
+    CONSTRAINT chk_pipeline_active CHECK (is_active IN ('Y', 'N'))
+);
+
+-- 6. PIPELINE_SCHEDULES
+CREATE TABLE pipeline_schedules (
+    pipeline_id NUMBER(10) NOT NULL,
+    schedule_type VARCHAR2(30) NOT NULL,
+    cron_expression VARCHAR2(100),
+    interval_seconds NUMBER(10),
+    timezone VARCHAR2(50) DEFAULT 'UTC' NOT NULL,
+    is_schedule_active CHAR(1) DEFAULT 'Y' NOT NULL,
+    CONSTRAINT pk_pipeline_schedules PRIMARY KEY (pipeline_id),
+    CONSTRAINT fk_pipeline_schedule FOREIGN KEY (pipeline_id) REFERENCES pipelines(pipeline_id) ON DELETE CASCADE,
+    CONSTRAINT chk_ps_active CHECK (is_schedule_active IN ('Y', 'N'))
+);
+
+-- 7. PIPELINE_COMPONENTS
+CREATE TABLE pipeline_components (
+    component_instance_id NUMBER(10) NOT NULL,
+    pipeline_id NUMBER(10) NOT NULL,
+    ds_component_id NUMBER(10) NOT NULL,
+    sequence_number NUMBER(10) NOT NULL,
+    nested_pipeline_id NUMBER(10) NULL,
+    component_alias VARCHAR2(150),
+    is_active CHAR(1) DEFAULT 'Y' NOT NULL,
+    functional_spec_url VARCHAR2(500),
+    technical_spec_url VARCHAR2(500),
+    component_docstring CLOB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_pipeline_components PRIMARY KEY (component_instance_id),
+    CONSTRAINT fk_pc_pipeline FOREIGN KEY (pipeline_id) REFERENCES pipelines(pipeline_id) ON DELETE CASCADE,
+    CONSTRAINT fk_pc_ds_component FOREIGN KEY (ds_component_id) REFERENCES data_source_components(ds_component_id),
+    CONSTRAINT fk_pc_nested_pipeline FOREIGN KEY (nested_pipeline_id) REFERENCES pipelines(pipeline_id),
+    CONSTRAINT chk_pc_active CHECK (is_active IN ('Y', 'N'))
+);
+
+-- 8. PIPELINE_COMPONENT_EDGES
+CREATE TABLE pipeline_component_edges (
+    component_edge_id NUMBER(10) NOT NULL,
+    pipeline_id NUMBER(10) NOT NULL,
+    source_component_instance_id NUMBER(10) NOT NULL,
+    target_component_instance_id NUMBER(10) NOT NULL,
+    condition_expression VARCHAR2(500),
+    condition_type VARCHAR2(30) DEFAULT 'always' NOT NULL,
+    CONSTRAINT pk_pipeline_component_edges PRIMARY KEY (component_edge_id),
+    CONSTRAINT fk_pce_pipeline FOREIGN KEY (pipeline_id) REFERENCES pipelines(pipeline_id) ON DELETE CASCADE,
+    CONSTRAINT fk_pce_source FOREIGN KEY (source_component_instance_id) REFERENCES pipeline_components(component_instance_id) ON DELETE CASCADE,
+    CONSTRAINT fk_pce_target FOREIGN KEY (target_component_instance_id) REFERENCES pipeline_components(component_instance_id) ON DELETE CASCADE
+);
+
+-- 9. COMPONENT_TASK_EDGES
+CREATE TABLE component_task_edges (
+    task_edge_id NUMBER(10) NOT NULL,
+    component_instance_id NUMBER(10) NOT NULL,
+    source_task_id NUMBER(10) NOT NULL,
+    target_task_id NUMBER(10) NOT NULL,
+    trigger_rule VARCHAR2(50) DEFAULT 'all_success' NOT NULL,
+    condition_expression VARCHAR2(500),
+    CONSTRAINT pk_component_task_edges PRIMARY KEY (task_edge_id),
+    CONSTRAINT fk_cte_component FOREIGN KEY (component_instance_id) REFERENCES pipeline_components(component_instance_id) ON DELETE CASCADE
+);
+
+-- 10. TASK_TABLE_MAPPINGS
+CREATE TABLE task_table_mappings (
+    table_mapping_id NUMBER(10) NOT NULL,
+    component_instance_id NUMBER(10) NOT NULL,
+    source_table VARCHAR2(150) NOT NULL,
+    destination_table VARCHAR2(150) NOT NULL,
+    load_type VARCHAR2(30) DEFAULT 'APPEND' NOT NULL,
+    is_active CHAR(1) DEFAULT 'Y' NOT NULL,
+    CONSTRAINT pk_task_table_mappings PRIMARY KEY (table_mapping_id),
+    CONSTRAINT fk_ttm_component FOREIGN KEY (component_instance_id) REFERENCES pipeline_components(component_instance_id) ON DELETE CASCADE,
+    CONSTRAINT chk_ttm_active CHECK (is_active IN ('Y', 'N'))
+);
+
+-- 11. TASK_FIELD_TRANSFORM_MAPPINGS
+CREATE TABLE task_field_transform_mappings (
+    field_mapping_id NUMBER(10) NOT NULL,
+    table_mapping_id NUMBER(10) NOT NULL,
+    source_field VARCHAR2(150) NOT NULL,
+    destination_field VARCHAR2(150) NOT NULL,
+    transformation_function VARCHAR2(100),
+    transformation_args VARCHAR2(250),
+    sequence_number NUMBER(10) NOT NULL,
+    functional_spec_url VARCHAR2(500),
+    rule_justification CLOB,
+    CONSTRAINT pk_task_field_trans_map PRIMARY KEY (field_mapping_id),
+    CONSTRAINT fk_tftm_table_mapping FOREIGN KEY (table_mapping_id) REFERENCES task_table_mappings(table_mapping_id) ON DELETE CASCADE
+);
+
+
+--------------------------------------------------------------------------------
+ SECTION 3: SEED DUMMY DATA FOR 3 COMPLETE PIPELINES
+--------------------------------------------------------------------------------
+
+-- =====================================================================
+-- MASTER REFERENCE DATA SEEDING
+-- =====================================================================
+
+INSERT INTO data_sources (data_source_id, data_source_name, description)
+VALUES (1, 'FXO', 'Foreign Exchange Options Feed System');
+
+INSERT INTO data_sources (data_source_id, data_source_name, description)
+VALUES (2, 'POWER', 'Energy & Power Derivatives Trading');
+
+INSERT INTO data_sources (data_source_id, data_source_name, description)
+VALUES (3, 'GECD', 'Global Equity Commodities Division');
+
+INSERT INTO component_types (component_type_id, component_type_name, description)
+VALUES (1, 'data_transfer', 'Data movement with dynamic dynamic table and column transformations');
+
+INSERT INTO component_types (component_type_id, component_type_name, description)
+VALUES (2, 'exclusion_type', 'Business exclusion rules filtering bad records');
+
+INSERT INTO component_types (component_type_id, component_type_name, description)
+VALUES (3, 'filter_type', 'Data subsetting and conditional filtering');
+
+INSERT INTO component_types (component_type_id, component_type_name, description)
+VALUES (4, 'control_type', 'Reconciliation, validation checks, and balance controls');
+
+INSERT INTO component_types (component_type_id, component_type_name, description)
+VALUES (5, 'pipeline', 'Nested child pipeline invocation');
+
+INSERT INTO component_types (component_type_id, component_type_name, description)
+VALUES (6, 'logical_component', 'Generic global component usable across all data sources');
+
+-- Component Associations
+-- FXO Data Transfer
+INSERT INTO data_source_components (ds_component_id, data_source_id, component_type_id)
+VALUES (10, 1, 1);
+
+-- FXO Exclusion
+INSERT INTO data_source_components (ds_component_id, data_source_id, component_type_id)
+VALUES (11, 1, 2);
+
+-- POWER Data Transfer
+INSERT INTO data_source_components (ds_component_id, data_source_id, component_type_id)
+VALUES (20, 2, 1);
+
+-- GECD Data Transfer
+INSERT INTO data_source_components (ds_component_id, data_source_id, component_type_id)
+VALUES (30, 3, 1);
+
+-- GECD Filter Type
+INSERT INTO data_source_components (ds_component_id, data_source_id, component_type_id)
+VALUES (31, 3, 3);
+
+-- GLOBAL LOGICAL COMPONENT (data_source_id = NULL)
+INSERT INTO data_source_components (ds_component_id, data_source_id, component_type_id)
+VALUES (99, NULL, 6);
+
+-- Task Function Definitions
+-- FXO Transfer Tasks
+INSERT INTO data_source_component_tasks (task_id, ds_component_id, phase, task_name, sequence_number, priority)
+VALUES (101, 10, 'pre', 'validate_fxo_raw_schema', 1, 1);
+
+INSERT INTO data_source_component_tasks (task_id, ds_component_id, phase, task_name, sequence_number, priority)
+VALUES (102, 10, 'main', 'execute_fxo_stg_transfer', 1, 1);
+
+INSERT INTO data_source_component_tasks (task_id, ds_component_id, phase, task_name, sequence_number, priority)
+VALUES (103, 10, 'post', 'audit_fxo_transfer_metrics', 1, 1);
+
+-- POWER Transfer Tasks
+INSERT INTO data_source_component_tasks (task_id, ds_component_id, phase, task_name, sequence_number, priority)
+VALUES (201, 20, 'pre', 'check_power_partition', 1, 1);
+
+INSERT INTO data_source_component_tasks (task_id, ds_component_id, phase, task_name, sequence_number, priority)
+VALUES (202, 20, 'main', 'execute_power_transfer', 1, 1);
+
+-- Global Logical Component Tasks
+INSERT INTO data_source_component_tasks (task_id, ds_component_id, phase, task_name, sequence_number, priority)
+VALUES (991, 99, 'pre', 'init_global_telemetry', 1, 1);
+
+INSERT INTO data_source_component_tasks (task_id, ds_component_id, phase, task_name, sequence_number, priority)
+VALUES (992, 99, 'main', 'log_pipeline_state', 1, 1);
+
+-- GECD Tasks
+INSERT INTO data_source_component_tasks (task_id, ds_component_id, phase, task_name, sequence_number, priority)
+VALUES (301, 30, 'main', 'execute_gecd_transfer', 1, 1);
+
+INSERT INTO data_source_component_tasks (task_id, ds_component_id, phase, task_name, sequence_number, priority)
+VALUES (311, 31, 'main', 'apply_gecd_filter', 1, 1);
+
+INSERT INTO data_source_component_tasks (task_id, ds_component_id, phase, task_name, sequence_number, priority)
+VALUES (312, 31, 'post', 'gecd_fallback_error_handler', 2, 2);
+
+
+-- =====================================================================
+-- PIPELINE 1: GL_FXO_DAILY_POSTING (Data Transfer & Field Transforms)
+-- =====================================================================
+
+INSERT INTO pipelines (pipeline_id, pipeline_name, data_source_id, description, functional_spec_url, technical_spec_url)
+VALUES (1001, 'GL_FXO_DAILY_POSTING', 1, 'Daily FXO trades ingestion pipeline', 'https://wiki/spec/func/fxo_1001', 'https://wiki/spec/tech/fxo_1001');
+
+INSERT INTO pipeline_schedules (pipeline_id, schedule_type, cron_expression, timezone)
+VALUES (1001, 'cron', '0 5 * * *', 'UTC');
+
+-- Component Instance 1
+INSERT INTO pipeline_components (component_instance_id, pipeline_id, ds_component_id, sequence_number, component_alias, functional_spec_url)
+VALUES (5001, 1001, 10, 1, 'FXO_DATA_TRANSFER_MAIN', 'https://wiki/spec/func/fxo_transfer');
+
+-- Table Mapping
+INSERT INTO task_table_mappings (table_mapping_id, component_instance_id, source_table, destination_table, load_type)
+VALUES (8001, 5001, 'FXO_RAW_TRADES', 'GL_STG_TRADES', 'APPEND');
+
+-- Field Mappings & Transformations
+INSERT INTO task_field_transform_mappings (field_mapping_id, table_mapping_id, source_field, destination_field, transformation_function, transformation_args, sequence_number, rule_justification)
+VALUES (9001, 8001, 'trade_id', 'TRD_ID', 'PASS_THROUGH', NULL, 1, 'Direct trade primary key mapping');
+
+INSERT INTO task_field_transform_mappings (field_mapping_id, table_mapping_id, source_field, destination_field, transformation_function, transformation_args, sequence_number, rule_justification)
+VALUES (9002, 8001, 'account_code', 'ACCT_CODE', 'TO_UPPER', NULL, 2, 'Normalize account string to uppercase');
+
+INSERT INTO task_field_transform_mappings (field_mapping_id, table_mapping_id, source_field, destination_field, transformation_function, transformation_args, sequence_number, rule_justification)
+VALUES (9003, 8001, 'trade_date', 'TRD_DT', 'CAST_TO_DATE', 'YYYY-MM-DD', 3, 'Cast raw ISO date string to Date type');
+
+
+-- =====================================================================
+-- PIPELINE 2: GL_POWER_MONTHLY_RECON (Uses Global Logical Component)
+-- =====================================================================
+
+INSERT INTO pipelines (pipeline_id, pipeline_name, data_source_id, description)
+VALUES (1002, 'GL_POWER_MONTHLY_RECON', 2, 'Power derivatives reconciliation pipeline');
+
+INSERT INTO pipeline_schedules (pipeline_id, schedule_type, cron_expression, timezone)
+VALUES (1002, 'cron', '0 0 1 * *', 'EST');
+
+-- Instance 1: POWER Specific Data Transfer
+INSERT INTO pipeline_components (component_instance_id, pipeline_id, ds_component_id, sequence_number, component_alias)
+VALUES (5002, 1002, 20, 1, 'POWER_TRANSFER_STEP');
+
+-- Instance 2: Global Logical Audit Component (Bound to data_source_id = NULL)
+INSERT INTO pipeline_components (component_instance_id, pipeline_id, ds_component_id, sequence_number, component_alias)
+VALUES (5003, 1002, 99, 2, 'GLOBAL_AUDIT_LOG_STEP');
+
+-- Inter-Component Edge (Step 1 -> Step 2)
+INSERT INTO pipeline_component_edges (component_edge_id, pipeline_id, source_component_instance_id, target_component_instance_id, condition_type)
+VALUES (7001, 1002, 5002, 5003, 'always');
+
+
+-- =====================================================================
+-- PIPELINE 3: GL_GECD_INTRA_DAY_FEED (Branching & Task Failover)
+-- =====================================================================
+
+INSERT INTO pipelines (pipeline_id, pipeline_name, data_source_id, description)
+VALUES (1003, 'GL_GECD_INTRA_DAY_FEED', 3, 'High frequency GECD trade feed pipeline');
+
+INSERT INTO pipeline_schedules (pipeline_id, schedule_type, interval_seconds, timezone)
+VALUES (1003, 'interval', 300, 'UTC');
+
+-- Component Instances
+INSERT INTO pipeline_components (component_instance_id, pipeline_id, ds_component_id, sequence_number, component_alias)
+VALUES (5004, 1003, 30, 1, 'GECD_TRANSFER_STEP');
+
+INSERT INTO pipeline_components (component_instance_id, pipeline_id, ds_component_id, sequence_number, component_alias)
+VALUES (5005, 1003, 31, 2, 'GECD_FILTER_STEP');
+
+-- Inter-Component Branching Edge
+INSERT INTO pipeline_component_edges (component_edge_id, pipeline_id, source_component_instance_id, target_component_instance_id, condition_expression, condition_type)
+VALUES (7002, 1003, 5004, 5005, 'row_count > 0', 'expression');
+
+-- Intra-Component Task Failover Edge (Task 311 fails -> routes to Task 312 error handler)
+INSERT INTO component_task_edges (task_edge_id, component_instance_id, source_task_id, target_task_id, trigger_rule)
+VALUES (6001, 5005, 311, 312, 'one_failed');
+
+COMMIT;
+
+
+--------------------------------------------------------------------------------
+ SECTION 4: ANGULAR 18 WORKFLOW BUILDER IMPLEMENTATION PSEUDO-CODE
+--------------------------------------------------------------------------------
+
+// =============================================================================
+// 1. DATA MODELS (workflow.model.ts)
+// =============================================================================
+
+export interface DataSource {
+  dataSourceId: number;
+  dataSourceName: string;
+}
+
+export interface ComponentType {
+  componentTypeId: number;
+  componentTypeName: string;
+}
+
+export interface PipelineComponentInstance {
+  componentInstanceId: string;
+  dsComponentId: number;
+  componentTypeName: string;
+  componentAlias: string;
+  sequenceNumber: number;
+  nestedPipelineId?: number | null;
+  functionalSpecUrl?: string;
+  technicalSpecUrl?: string;
+  componentDocstring?: string;
+  tableMappings?: TableMapping[];
+}
+
+export interface TableMapping {
+  tableMappingId: string;
+  sourceTable: string;
+  destinationTable: string;
+  loadType: string;
+  fieldMappings: FieldMapping[];
+}
+
+export interface FieldMapping {
+  sourceField: string;
+  destinationField: string;
+  transformationFunction?: string;
+  ruleJustification?: string;
+}
+
+export interface PipelinePayload {
+  pipelineName: string;
+  dataSourceId: number;
+  description: string;
+  functionalSpecUrl: string;
+  technicalSpecUrl: string;
+  schedule: {
+    scheduleType: string;
+    cronExpression: string;
+    timezone: string;
+  };
+  components: PipelineComponentInstance[];
+}
+
+
+// =============================================================================
+// 2. ANGULAR COMPONENT (workflow-builder.component.ts)
+// =============================================================================
+
+import { Component, OnInit } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { DragDropModule, CdkDragDrop, moveItemInArray } from '@angular/cdk/drag-and-drop';
+import { DataSource, ComponentType, PipelineComponentInstance, PipelinePayload } from './workflow.model';
+import { WorkflowService } from './workflow.service';
+
+@Component({
+  selector: 'app-workflow-builder',
+  standalone: true,
+  imports: [CommonModule, FormsModule, DragDropModule],
+  templateUrl: './workflow-builder.component.html',
+  styleUrls: ['./workflow-builder.component.scss']
+})
+export class WorkflowBuilderComponent implements OnInit {
+  dataSources: DataSource[] = [];
+  availableComponentTypes: ComponentType[] = [];
+
+  selectedDataSourceId: number | null = null;
+  pipelineName: string = '';
+  pipelineDescription: string = '';
+  functionalSpecUrl: string = '';
+  technicalSpecUrl: string = '';
+  cronExpression: string = '0 5 * * *';
+
+  canvasComponents: PipelineComponentInstance[] = [];
+  selectedComponent: PipelineComponentInstance | null = null;
+
+  constructor(private workflowService: WorkflowService) {}
+
+  ngOnInit(): void {
+    this.workflowService.getDataSources().subscribe(res => this.dataSources = res);
+  }
+
+  onDataSourceChange(dataSourceId: number): void {
+    this.selectedDataSourceId = dataSourceId;
+    // Fetches DS-specific components AND global Logical Components (data_source_id IS NULL)
+    this.workflowService.getComponentsForDataSource(dataSourceId).subscribe(res => {
+      this.availableComponentTypes = res;
+    });
+  }
+
+  onDrop(event: CdkDragDrop<any[]>): void {
+    if (event.previousContainer === event.container) {
+      moveItemInArray(this.canvasComponents, event.previousIndex, event.currentIndex);
+      this.resequence();
+    } else {
+      const compType: ComponentType = event.previousContainer.data[event.previousIndex];
+      const newInstance: PipelineComponentInstance = {
+        componentInstanceId: 'comp_' + Math.random().toString(36).substring(2, 9),
+        dsComponentId: compType.componentTypeId,
+        componentTypeName: compType.componentTypeName,
+        componentAlias: `${compType.componentTypeName}_${this.canvasComponents.length + 1}`,
+        sequenceNumber: event.currentIndex + 1,
+        nestedPipelineId: compType.componentTypeName === 'pipeline' ? null : undefined,
+        tableMappings: compType.componentTypeName === 'data_transfer' ? [] : undefined
+      };
+      this.canvasComponents.splice(event.currentIndex, 0, newInstance);
+      this.resequence();
+      this.selectComponent(newInstance);
+    }
+  }
+
+  private resequence(): void {
+    this.canvasComponents.forEach((comp, idx) => comp.sequenceNumber = idx + 1);
+  }
+
+  selectComponent(comp: PipelineComponentInstance): void {
+    this.selectedComponent = comp;
+  }
+
+  savePipeline(): void {
+    if (!this.selectedDataSourceId || !this.pipelineName) {
+      alert('Please fill required pipeline headers.');
+      return;
+    }
+    const payload: PipelinePayload = {
+      pipelineName: this.pipelineName,
+      dataSourceId: this.selectedDataSourceId,
+      description: this.pipelineDescription,
+      functionalSpecUrl: this.functionalSpecUrl,
+      technicalSpecUrl: this.technicalSpecUrl,
+      schedule: {
+        scheduleType: 'cron',
+        cronExpression: this.cronExpression,
+        timezone: 'UTC'
+      },
+      components: this.canvasComponents
+    };
+    this.workflowService.savePipeline(payload).subscribe(() => alert('Saved successfully!'));
+  }
+}
+
+
+// =============================================================================
+// 3. TEMPLATE HTML (workflow-builder.component.html)
+// =============================================================================
+
+/*
+<div class="workflow-builder-container" cdkDropListGroup>
+  <header class="pipeline-header">
+    <input type="text" [(ngModel)]="pipelineName" placeholder="Pipeline Name" />
+    <select [(ngModel)]="selectedDataSourceId" (ngModelChange)="onDataSourceChange($event)">
+      <option *ngFor="let ds of dataSources" [value]="ds.dataSourceId">{{ ds.dataSourceName }}</option>
+    </select>
+    <button (click)="savePipeline()">Save Pipeline</button>
+  </header>
+
+  <div class="workspace">
+    <aside class="palette">
+      <div cdkDropList id="paletteList" [cdkDropListData]="availableComponentTypes" [cdkDropListConnectedTo]="['canvasList']">
+        <div *ngFor="let ct of availableComponentTypes" cdkDrag class="palette-node">
+          {{ ct.componentTypeName }}
+        </div>
+      </div>
+    </aside>
+
+    <main class="canvas">
+      <div cdkDropList id="canvasList" [cdkDropListData]="canvasComponents" (cdkDropListDropped)="onDrop($event)">
+        <div *ngFor="let comp of canvasComponents; let i = index" cdkDrag (click)="selectComponent(comp)" class="component-card">
+          <span>[{{ comp.sequenceNumber }}] {{ comp.componentAlias }}</span>
+        </div>
+      </div>
+    </main>
+
+    <aside class="drawer" *ngIf="selectedComponent">
+      <h3>Config: {{ selectedComponent.componentAlias }}</h3>
+      <input type="text" [(ngModel)]="selectedComponent.functionalSpecUrl" placeholder="Functional Spec URL" />
+      <input type="text" [(ngModel)]="selectedComponent.technicalSpecUrl" placeholder="Technical Spec URL" />
+    </aside>
+  </div>
+</div>
+*/
